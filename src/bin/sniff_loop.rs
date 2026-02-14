@@ -1,11 +1,17 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 
 use ndarray::{Array1, Array2};
 
 use llm_nature_experiential::adapter::{bayes_update, normalize};
+use llm_nature_experiential::broadcast::{apply_broadcast, expand_rg_to_n, rg_avg_pool};
 use llm_nature_experiential::ignition::{coherence, efficiency, Params};
+use llm_nature_experiential::ledger::{ndjson_write_row, ReplayRow, TraceRow};
+use llm_nature_experiential::memory::{MemoryRow, MemoryState};
+use llm_nature_experiential::policy::choose_action;
+use llm_nature_experiential::sensory::sensory_from_flat_col;
+use llm_nature_experiential::util::{ravel_multi_index, safe_ln_n};
 
 const EPS: f64 = 1e-9;
 
@@ -23,55 +29,6 @@ struct StreamEvent {
     touch_pressure: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct TraceRow {
-    t: u64,
-    o_idx: usize,
-    u_t: f64,
-    g_before: f64,
-    g_after_local: f64,
-    g_after_broadcast: f64,
-    d_g_local: f64,
-    d_g_broadcast: f64,
-    ignited: bool,
-    ignite_reason: String,
-    theta: f64,
-    survivors_n: usize,
-    coherence: f64,
-    survivor_levels: Vec<u8>,
-    q_after: Vec<f64>,
-    broadcast: Vec<f64>,
-    dx: Vec<f64>,
-    e: f64,
-    p: f64,
-    k: f64,
-    eta: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReplayRow {
-    t: u64,
-    o_idx: usize,
-    sniff_strength: f64,
-    touch_pressure: f64,
-    temperature: f64,
-    q_before: Vec<f64>,
-    q_after: Vec<f64>,
-    q_broadcast: Vec<f64>,
-    q_next: Vec<f64>,
-    survivors_n: usize,
-    survivor_levels: Vec<u8>,
-    broadcast: Vec<f64>,
-    b_expanded: Vec<f64>,
-    ignited: bool,
-    ignite_reason: String,
-    g_before: f64,
-    g_after_local: f64,
-    g_after_broadcast: f64,
-    d_g_local: f64,
-    d_g_broadcast: f64,
-}
-
 #[derive(Clone, Debug)]
 struct Msg {
     level: u8,
@@ -80,17 +37,6 @@ struct Msg {
     e: f64,
     p: f64,
     k: f64,
-}
-
-fn ravel_multi_index(o: &[usize], shape: &[usize]) -> usize {
-    let mut idx = 0usize;
-    let mut stride = 1usize;
-    for (i, dim) in shape.iter().rev().enumerate() {
-        let oi = o[o.len() - 1 - i];
-        idx += oi * stride;
-        stride *= *dim;
-    }
-    idx
 }
 
 fn entropy(q: &Array1<f64>) -> f64 {
@@ -123,24 +69,6 @@ fn vfe(q: &Array1<f64>, p_prior: &Array1<f64>, likelihood_col: &Array1<f64>) -> 
     kl(&qn, &pn) - eloglik
 }
 
-fn rg_avg_pool(v: &Array1<f64>, rg_level: usize) -> Array1<f64> {
-    let k = 1usize << rg_level;
-    if k <= 1 {
-        return v.clone();
-    }
-    let n = (v.len() / k) * k;
-    if n == 0 {
-        return Array1::from_vec(vec![0.0]);
-    }
-    let mut out = Vec::with_capacity(n / k);
-    let vv = v.slice(ndarray::s![0..n]).to_vec();
-    for chunk in vv.chunks_exact(k) {
-        let m = chunk.iter().sum::<f64>() / (k as f64);
-        out.push(m);
-    }
-    Array1::from_vec(out)
-}
-
 fn precision_from_dx(dx: &Array1<f64>, task: &Array1<f64>, level: u8) -> Array1<f64> {
     let mut prec = dx.mapv(|x| x.abs());
     if level == 1 {
@@ -153,7 +81,12 @@ fn precision_from_dx(dx: &Array1<f64>, task: &Array1<f64>, level: u8) -> Array1<
     prec.mapv(|x| x / norm)
 }
 
-fn msg_metrics(q_before: &Array1<f64>, q_after: &Array1<f64>, task: &Array1<f64>, level: u8) -> Msg {
+fn msg_metrics(
+    q_before: &Array1<f64>,
+    q_after: &Array1<f64>,
+    task: &Array1<f64>,
+    level: u8,
+) -> Msg {
     let qb = normalize(q_before);
     let qa = normalize(q_after);
     let dx = &qa - &qb;
@@ -165,7 +98,14 @@ fn msg_metrics(q_before: &Array1<f64>, q_after: &Array1<f64>, task: &Array1<f64>
     let k = l2 + 0.5 * (nnz / (dx.len() as f64 + EPS));
 
     let prec = precision_from_dx(&dx, task, level);
-    Msg { level, dx, prec, e, p, k }
+    Msg {
+        level,
+        dx,
+        prec,
+        e,
+        p,
+        k,
+    }
 }
 
 fn task_biased_belief(q: &Array1<f64>, task: &Array1<f64>, gain: f64) -> Array1<f64> {
@@ -177,54 +117,6 @@ fn task_biased_belief(q: &Array1<f64>, task: &Array1<f64>, gain: f64) -> Array1<
     let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let ex = logits.mapv(|x| (x - m).exp());
     &ex / (ex.sum().max(EPS))
-}
-
-fn expand_rg_to_n(b_rg: &Array1<f64>, n: usize, rg_level: usize) -> Array1<f64> {
-    if b_rg.len() == 0 {
-        return Array1::from_vec(vec![0.0; n]);
-    }
-    let k = 1usize << rg_level;
-    let mut out: Vec<f64> = Vec::with_capacity(n);
-    for &v in b_rg.iter() {
-        for _ in 0..k {
-            out.push(v);
-        }
-    }
-    out.truncate(n);
-    if out.len() < n {
-        out.extend(std::iter::repeat(0.0).take(n - out.len()));
-    }
-    Array1::from_vec(out)
-}
-
-fn apply_broadcast(q: &Array1<f64>, b_expanded: &Array1<f64>, lambda: f64) -> Array1<f64> {
-    let mut logits = q.mapv(|x| x.max(EPS).ln());
-    for i in 0..q.len() {
-        logits[i] += lambda * b_expanded[i];
-    }
-    let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let ex = logits.mapv(|x| (x - m).exp());
-    &ex / (ex.sum().max(EPS))
-}
-
-// strength/pressure -> temperature -> power-transform likelihood
-fn modulate_likelihood(lik: &Array1<f64>, sniff_strength: f64, touch_pressure: f64) -> (Array1<f64>, f64) {
-    let t0 = 1.0f64;
-    let k_touch = 0.75f64;
-
-    let denom = (sniff_strength.max(0.0) + k_touch * touch_pressure.max(0.0)).max(EPS);
-    let mut temp = t0 / denom;
-
-    let t_min = 0.25f64;
-    let t_max = 4.0f64;
-    if temp < t_min { temp = t_min; }
-    if temp > t_max { temp = t_max; }
-
-    let inv_t = 1.0f64 / temp;
-    let mut v = lik.mapv(|x| x.max(EPS).powf(inv_t));
-    let z = v.sum().max(EPS);
-    v.mapv_inplace(|x| x / z);
-    (v, temp)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -248,6 +140,7 @@ fn main() -> anyhow::Result<()> {
     let fin = BufReader::new(File::open(in_path)?);
 
     let mut q_state: Option<Array1<f64>> = None;
+    let mut mem = MemoryState::new(64);
 
     for line in fin.lines() {
         let line = line?;
@@ -258,7 +151,11 @@ fn main() -> anyhow::Result<()> {
 
         let n = ev.p_prior.len();
         if ev.A_shape.is_empty() || ev.A_shape[0] != n {
-            anyhow::bail!("A_shape mismatch: expected first dim {}, got {:?}", n, ev.A_shape);
+            anyhow::bail!(
+                "A_shape mismatch: expected first dim {}, got {:?}",
+                n,
+                ev.A_shape
+            );
         }
 
         let o_shape = &ev.A_shape[1..];
@@ -267,31 +164,32 @@ fn main() -> anyhow::Result<()> {
         let p_prior = Array1::from(ev.p_prior);
         let task = Array1::from(ev.task_vec);
 
-        // initialize or carry q
         if q_state.is_none() {
             let q0 = ev.q0.clone().unwrap_or_else(|| p_prior.to_vec());
             q_state = Some(Array1::from(q0));
         }
         let q_before = q_state.as_ref().unwrap().clone();
 
-        let sniff_strength = ev.sniff_strength.unwrap_or(1.0);
-        let touch_pressure = ev.touch_pressure.unwrap_or(0.0);
+        let mem_feat_pre = mem.features(ev.t);
 
-        // likelihood modulation
-        let lik_raw = Array1::from(ev.A_flat_col);
-        if lik_raw.len() != n {
-            anyhow::bail!("A_flat_col len mismatch: got {}, expected {}", lik_raw.len(), n);
-        }
-        let (lik_col, temperature) = modulate_likelihood(&lik_raw, sniff_strength, touch_pressure);
+        let (sniff_strength, touch_pressure, action_source) =
+            match (ev.sniff_strength, ev.touch_pressure) {
+                (Some(s), Some(tp)) => (s, tp, "event".to_string()),
+                _ => {
+                    let a = choose_action(&q_before, &mem_feat_pre);
+                    (a.sniff_strength, a.touch_pressure, "policy".to_string())
+                }
+            };
 
-        let u_t = entropy(&normalize(&q_before)) / ((n as f64).ln().max(EPS));
+        let sensory = sensory_from_flat_col(ev.A_flat_col, sniff_strength, touch_pressure);
+        let lik_col = Array1::from(sensory.lik_mod.clone());
+
+        let u_t = entropy(&normalize(&q_before)) / safe_ln_n(n);
         let g_before = vfe(&q_before, &p_prior, &lik_col);
 
-        // level0 posterior (using modulated likelihood)
         let q_after = bayes_update(&normalize(&p_prior), &normalize(&lik_col));
         let g_after_local = vfe(&q_after, &p_prior, &lik_col);
 
-        // level1 task interpretation
         let q_task = task_biased_belief(&q_after, &task, 0.05);
 
         let m0 = msg_metrics(&q_before, &q_after, &task, 0);
@@ -331,7 +229,10 @@ fn main() -> anyhow::Result<()> {
         let broadcast = if survivors_n == 0 {
             Array1::from_vec(vec![])
         } else {
-            let mut etas: Vec<f64> = survivors.iter().map(|m| efficiency(m.e, m.p, m.k)).collect();
+            let mut etas: Vec<f64> = survivors
+                .iter()
+                .map(|m| efficiency(m.e, m.p, m.k))
+                .collect();
             let max_eta = etas.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             for x in etas.iter_mut() {
                 *x = (*x - max_eta).exp();
@@ -366,7 +267,11 @@ fn main() -> anyhow::Result<()> {
 
         let ignited = ignite_reason == "ignite";
 
-        let q_next = if ignited { q_broadcast.clone() } else { q_after.clone() };
+        let q_next = if ignited {
+            q_broadcast.clone()
+        } else {
+            q_after.clone()
+        };
         q_state = Some(q_next.clone());
 
         let (dx0, e0, p0, k0, eta0) = if survivors_n == 0 {
@@ -400,14 +305,25 @@ fn main() -> anyhow::Result<()> {
             k: k0,
             eta: eta0,
         };
-        writeln!(ftrace, "{}", serde_json::to_string(&trace)?)?;
+        ndjson_write_row(&mut ftrace, &trace)?;
+
+        mem.push(MemoryRow {
+            t: ev.t,
+            ignited,
+            d_g_broadcast,
+            temperature: sensory.temperature,
+            sniff_strength,
+            touch_pressure,
+        });
+        let mem_feat_post = mem.features(ev.t);
 
         let replay = ReplayRow {
             t: ev.t,
             o_idx,
             sniff_strength,
             touch_pressure,
-            temperature,
+            action_source,
+            temperature: sensory.temperature,
             q_before: q_before.to_vec(),
             q_after: q_after.to_vec(),
             q_broadcast: q_broadcast.to_vec(),
@@ -423,8 +339,11 @@ fn main() -> anyhow::Result<()> {
             g_after_broadcast,
             d_g_local,
             d_g_broadcast,
+            mem_window_len: mem_feat_post.window_len,
+            mem_ignite_rate: mem_feat_post.ignite_rate,
+            mem_mean_d_g_broadcast: mem_feat_post.mean_d_g_broadcast,
         };
-        writeln!(freplay, "{}", serde_json::to_string(&replay)?)?;
+        ndjson_write_row(&mut freplay, &replay)?;
     }
 
     println!("Wrote out/trace_loop.ndjson and out/replay_loop.ndjson");

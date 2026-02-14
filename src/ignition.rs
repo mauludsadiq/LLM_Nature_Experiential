@@ -1,5 +1,5 @@
 use ndarray::Array2;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Params {
@@ -16,7 +16,9 @@ pub fn efficiency(e: f64, p: f64, k: f64) -> f64 {
 
 pub fn coherence(p: &Array2<f64>) -> f64 {
     let n = p.nrows();
-    if n == 0 { return 0.0; }
+    if n == 0 {
+        return 0.0;
+    }
     let mut sum = 0.0;
     for i in 0..n {
         for j in 0..n {

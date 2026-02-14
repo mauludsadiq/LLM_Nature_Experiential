@@ -13,3 +13,8 @@ serde_json = "1.0"
 [[bin]]
 name = "sniff_run"
 path = "src/bin/sniff_run.rs"
+
+
+[[bin]]
+name = "sniff_loop"
+path = "src/bin/sniff_loop.rs"
