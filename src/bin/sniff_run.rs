@@ -159,7 +159,7 @@ fn main() -> Result<()> {
         match (ev.sniff_strength, ev.touch_pressure) {
             (Some(s), Some(tp)) => (s, tp, "event".to_string()),
             _ => {
-                let a = choose_action(&q_before, &mem_feat_pre);
+                let a = choose_action(&q_before, &mem_feat_pre, &task);
                 (a.sniff_strength, a.touch_pressure, "policy".to_string())
             }
         };

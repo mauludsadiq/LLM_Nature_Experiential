@@ -21,7 +21,10 @@ struct StreamEvent {
     t: u64,
     o: Vec<usize>,
     A_shape: Vec<usize>,
-    A_flat_col: Vec<f64>,
+    #[serde(alias = "A_flat_col")]
+    a_flat_col: Vec<f64>,
+    #[allow(dead_code)]
+    tactile_flat_col: Option<Vec<f64>>,
     p_prior: Vec<f64>,
     task_vec: Vec<f64>,
     q0: Option<Vec<f64>>,
@@ -176,12 +179,12 @@ fn main() -> anyhow::Result<()> {
             match (ev.sniff_strength, ev.touch_pressure) {
                 (Some(s), Some(tp)) => (s, tp, "event".to_string()),
                 _ => {
-                    let a = choose_action(&q_before, &mem_feat_pre);
+                    let a = choose_action(&q_before, &mem_feat_pre, &task);
                     (a.sniff_strength, a.touch_pressure, "policy".to_string())
                 }
             };
 
-        let sensory = sensory_from_flat_col(ev.A_flat_col, sniff_strength, touch_pressure);
+        let sensory = sensory_from_flat_col(ev.a_flat_col, sniff_strength, touch_pressure);
         let lik_col = Array1::from(sensory.lik_mod.clone());
 
         let u_t = entropy(&normalize(&q_before)) / safe_ln_n(n);

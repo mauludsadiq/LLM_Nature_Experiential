@@ -70,3 +70,41 @@ impl MemoryState {
         1.0 / (1.0 + (n / 16.0).max(EPS))
     }
 }
+
+use crate::policy::MemoryStats;
+
+impl MemoryState {
+    pub fn mem_window_len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn mem_ignite_rate(&self) -> f64 {
+        let n = self.rows.len().max(1) as f64;
+        self.rows.iter().filter(|r| r.ignited).count() as f64 / n
+    }
+
+    pub fn mem_mean_dg_broadcast(&self) -> f64 {
+        let n = self.rows.len().max(1) as f64;
+        self.rows.iter().map(|r| r.d_g_broadcast).sum::<f64>() / n
+    }
+}
+
+impl MemoryStats for MemoryState {
+    fn mem_ignite_rate(&self) -> f64 {
+        self.mem_ignite_rate()
+    }
+
+    fn mem_mean_dg_broadcast(&self) -> f64 {
+        self.mem_mean_dg_broadcast()
+    }
+}
+
+impl crate::policy::MemoryStats for MemoryFeatures {
+    fn mem_ignite_rate(&self) -> f64 {
+        self.ignite_rate
+    }
+
+    fn mem_mean_dg_broadcast(&self) -> f64 {
+        self.mean_d_g_broadcast
+    }
+}

@@ -19,7 +19,11 @@ fn layers_exist_and_link() {
 
     let mem = MemoryState::new(8);
     let feat = mem.features(0);
-    let a = choose_action(&ndarray::Array1::from_vec(vec![0.4, 0.2, 0.2, 0.2]), &feat);
+    let a = choose_action(
+        &ndarray::Array1::from_vec(vec![0.4, 0.2, 0.2, 0.2]),
+        &feat,
+        &ndarray::Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0]),
+    );
     assert!(a.sniff_strength > 0.0);
 
     let _phantom: Option<(TraceRow, ReplayRow)> = None;
