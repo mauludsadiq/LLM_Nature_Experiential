@@ -14,3 +14,6 @@ out/
 .vscode/
 .idea/
 target/
+
+# test temp artifacts
+/data/*.tmp
