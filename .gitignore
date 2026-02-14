@@ -1,0 +1,15 @@
+
+# Rust
+/target/
+/**/target/
+**/*.rs.bk
+
+# Local run outputs (if you keep them, keep them out of git)
+out/
+/_out/
+/out-*/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
